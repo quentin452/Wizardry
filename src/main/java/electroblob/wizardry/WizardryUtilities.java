@@ -239,9 +239,8 @@ public final class WizardryUtilities {
 		double dx = entity.getLookVec().xCoord * range;
 		double dy = entity.getLookVec().yCoord * range;
 		double dz = entity.getLookVec().zCoord * range;
-		HashSet hashset = new HashSet(1);
-		hashset.add(entity);
-		return WizardryUtilities.tracePath(world, (float)entity.posX, (float)(entity.posY + entity.getEyeHeight()), (float)entity.posZ, (float)(entity.posX + dx), (float)(entity.posY + entity.getEyeHeight() + dy), (float)(entity.posZ + dz), 1.0f, hashset, false);
+		Set<Entity> excluded = Collections.singleton(entity);
+		return WizardryUtilities.tracePath(world, (float)entity.posX, (float)(entity.posY + entity.getEyeHeight()), (float)entity.posZ, (float)(entity.posX + dx), (float)(entity.posY + entity.getEyeHeight() + dy), (float)(entity.posZ + dz), 1.0f, excluded, false);
 	}
 
 	/**
@@ -258,9 +257,8 @@ public final class WizardryUtilities {
 		double dx = entity.getLookVec().xCoord * range;
 		double dy = entity.getLookVec().yCoord * range;
 		double dz = entity.getLookVec().zCoord * range;
-		HashSet hashset = new HashSet(1);
-		hashset.add(entity);
-		return WizardryUtilities.tracePath(world, (float)entity.posX, (float)(entity.posY + entity.getEyeHeight()), (float)entity.posZ, (float)(entity.posX + dx), (float)(entity.posY + entity.getEyeHeight() + dy), (float)(entity.posZ + dz), borderSize, hashset, false);
+		Set<Entity> excluded = Collections.singleton(entity);
+		return WizardryUtilities.tracePath(world, (float)entity.posX, (float)(entity.posY + entity.getEyeHeight()), (float)entity.posZ, (float)(entity.posX + dx), (float)(entity.posY + entity.getEyeHeight() + dy), (float)(entity.posZ + dz), borderSize, excluded, false);
 	}
 
 	/**
@@ -279,44 +277,110 @@ public final class WizardryUtilities {
 	 */
     public static MovingObjectPosition tracePath(World world, float startX, float startY, float startZ,
                                                  float endX, float endY, float endZ,
-                                                 float borderSize, HashSet<Entity> excluded, boolean collideablesOnly) {
+                                                 float borderSize, Set<Entity> excluded, boolean collideablesOnly) {
         Vec3 startVector = Vec3.createVectorHelper(startX, startY, startZ);
         Vec3 endVector = Vec3.createVectorHelper(endX, endY, endZ);
 
-        AxisAlignedBB boundingBox = AxisAlignedBB.getBoundingBox(
-            Math.min(startX, endX), Math.min(startY, endY), Math.min(startZ, endZ),
-            Math.max(startX, endX), Math.max(startY, endY), Math.max(startZ, endZ)
-        ).expand(borderSize, borderSize, borderSize);
+        // Early return if start and end are the same
+        if (startX == endX && startY == endY && startZ == endZ) {
+            return null;
+        }
 
-        List<Entity> allEntities = world.getEntitiesWithinAABBExcludingEntity(null, boundingBox);
+        // Calculate ray distance once for later optimizations
+        double rayDistance = startVector.distanceTo(endVector);
+        
+        // Early return for very short rays
+        if (rayDistance < 0.1) {
+            return null;
+        }
+
+        // Check blocks first as it's faster
         MovingObjectPosition blockHit = world.rayTraceBlocks(startVector, endVector);
-
         if (blockHit != null) {
             return blockHit;
         }
 
-        return findClosestEntity(allEntities, startVector, endVector, excluded, collideablesOnly);
+        // Optimize bounding box size based on ray length and border size
+        float optimizedBorderSize = Math.min(borderSize, (float)rayDistance * 0.5f);
+        AxisAlignedBB boundingBox = AxisAlignedBB.getBoundingBox(
+            Math.min(startX, endX), Math.min(startY, endY), Math.min(startZ, endZ),
+            Math.max(startX, endX), Math.max(startY, endY), Math.max(startZ, endZ)
+        ).expand(optimizedBorderSize, optimizedBorderSize, optimizedBorderSize);
+
+        // Get entities with a more specific class filter to reduce list size
+        List<Entity> allEntities = world.getEntitiesWithinAABBExcludingEntity(null, boundingBox);
+        
+        // Pre-filter entities to reduce processing
+        if (allEntities.size() > 50) {
+            allEntities = preFilterEntitiesByDistance(allEntities, startX, startY, startZ, rayDistance + optimizedBorderSize);
+        }
+
+        return findClosestEntity(allEntities, startVector, endVector, excluded, collideablesOnly, rayDistance);
+    }
+
+    /**
+     * Pre-filters entities by distance to reduce processing load
+     */
+    private static List<Entity> preFilterEntitiesByDistance(List<Entity> entities, float startX, float startY, float startZ, double maxDistance) {
+        List<Entity> filtered = new ArrayList<Entity>();
+        double maxDistanceSquared = maxDistance * maxDistance;
+        
+        for (Entity entity : entities) {
+            double dx = entity.posX - startX;
+            double dy = entity.posY - startY;
+            double dz = entity.posZ - startZ;
+            double distanceSquared = dx * dx + dy * dy + dz * dz;
+            
+            if (distanceSquared <= maxDistanceSquared) {
+                filtered.add(entity);
+            }
+        }
+        return filtered;
     }
 
     private static MovingObjectPosition findClosestEntity(List<Entity> entities, Vec3 startVector, Vec3 endVector,
-                                                          HashSet<Entity> excluded, boolean collideablesOnly) {
+                                                          Set<Entity> excluded, boolean collideablesOnly, double rayDistance) {
         Entity closestHitEntity = null;
         float closestHitDistance = Float.MAX_VALUE;
+        int entityCount = entities.size();
+        
+        // Early return if no entities to check
+        if (entityCount == 0) {
+            return null;
+        }
 
-        for (Entity entity : entities) {
-            if ((entity.canBeCollidedWith() || !collideablesOnly) && (excluded == null || !excluded.contains(entity))) {
-                AxisAlignedBB entityBoundingBox = entity.boundingBox;
-                if (entityBoundingBox != null) {
-                    float entityBorder = entity.getCollisionBorderSize();
-                    entityBoundingBox = entityBoundingBox.expand(entityBorder, entityBorder, entityBorder);
-                    MovingObjectPosition intercept = entityBoundingBox.calculateIntercept(startVector, endVector);
-                    if (intercept != null) {
-                        float currentHitDistance = (float) intercept.hitVec.distanceTo(startVector);
-                        if (currentHitDistance < closestHitDistance || closestHitEntity == null) {
-                            closestHitDistance = currentHitDistance;
-                            closestHitEntity = entity;
-                        }
-                    }
+        for (int i = 0; i < entityCount; i++) {
+            Entity entity = entities.get(i);
+            
+            // Quick exclusion checks first
+            if (excluded != null && excluded.contains(entity)) {
+                continue;
+            }
+            
+            if (collideablesOnly && !entity.canBeCollidedWith()) {
+                continue;
+            }
+            
+            AxisAlignedBB entityBoundingBox = entity.boundingBox;
+            if (entityBoundingBox == null) {
+                continue;
+            }
+            
+            // Quick distance check before expensive intersection calculation
+            double entityDistance = entity.getDistance(startVector.xCoord, startVector.yCoord, startVector.zCoord);
+            if (entityDistance > rayDistance + 5.0) { // Add small buffer
+                continue;
+            }
+            
+            float entityBorder = entity.getCollisionBorderSize();
+            AxisAlignedBB expandedBox = entityBoundingBox.expand(entityBorder, entityBorder, entityBorder);
+            MovingObjectPosition intercept = expandedBox.calculateIntercept(startVector, endVector);
+            
+            if (intercept != null) {
+                float currentHitDistance = (float) intercept.hitVec.distanceTo(startVector);
+                if (currentHitDistance < closestHitDistance) {
+                    closestHitDistance = currentHitDistance;
+                    closestHitEntity = entity;
                 }
             }
         }
@@ -326,6 +390,13 @@ public final class WizardryUtilities {
         }
 
         return null;
+    }
+    
+    // Overloaded method for backward compatibility
+    private static MovingObjectPosition findClosestEntity(List<Entity> entities, Vec3 startVector, Vec3 endVector,
+                                                          Set<Entity> excluded, boolean collideablesOnly) {
+        double rayDistance = startVector.distanceTo(endVector);
+        return findClosestEntity(entities, startVector, endVector, excluded, collideablesOnly, rayDistance);
     }
 
 	// Just what benefit does having posY be the eye position on the first person client actually give?
